@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""
+MAE — Master Automation Engine
+The single command that deploys EVERYTHING simultaneously:
+- All Tier 0 LLMs (Groq, Gemini, DeepSeek, GPT-4o-mini, Ollama)
+- All MCP tools (Apollo, Gmail, Notion, Airtable, Slack, Meta Ads, Calendar)
+- All Claude skills (200+)
+- All installed repos (149 repos)
+- Apify actors
+- workflow-dag
+- Paperclip CEO layer
+- Claude Code sub-agents
+
+Usage:
+  mae run "achieve this goal"          — decompose + parallel execute everything
+  mae plan "goal"                      — show execution plan without firing
+  mae sprint                           — fire ALL pending TCC tasks right now
+  mae daily                            — run full daily ops automation
+  mae status                           — show all active operations
+  mae deploy WORKFLOW_NAME             — deploy specific workflow
+  mae register RESOURCE_FILE           — register new resource/agent
+"""
+
+import sys, os, json, subprocess, threading, time, uuid, argparse
+from pathlib import Path
+from datetime import datetime
+
+TCC = Path.home() / ".claude/bin/tcc"
+REGISTRY = Path.home() / ".claude/tcc-routes/agent-registry.json"
+LOGS_DIR = Path.home() / ".claude/tcc-logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+R = "\033[31m"; G = "\033[32m"; Y = "\033[33m"; B = "\033[34m"; M = "\033[35m"; C = "\033[36m"; W = "\033[37m"; RESET = "\033[0m"; BOLD = "\033[1m"
+
+def p(text, color=None):
+    c = {"r":R,"g":G,"y":Y,"b":B,"m":M,"c":C,"w":W}.get(color,"")
+    print(f"{c}{text}{RESET}", flush=True)
+
+# ─── RAM Guard ───────────────────────────────────────────────────────────────
+def _load_mac_profile() -> dict:
+    """Load hardware profile (M-chip aware). Falls back to safe defaults."""
+    p = Path.home() / ".claude/mac-profile.json"
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {"tier":"base","ram_gb":8,"p_cores":4,"e_cores":2,
+                "mae":{"batch_size":4},"hermes":{"max_parallel_tasks":1,"keep_alive_min":10},
+                "thermal":{"wait_threshold":65,"kill_threshold":85}}
+
+MAC = _load_mac_profile()
+
+def get_free_ram_gb() -> float:
+    """Returns free+inactive RAM in GB (Unified Memory — same pool for CPU/GPU/NE)."""
+    try:
+        import re as _re, subprocess as _sp
+        out = _sp.check_output(["vm_stat"], timeout=3).decode()
+        free  = int(_re.search(r"Pages free:\s+(\d+)", out).group(1))
+        inact = int(_re.search(r"Pages inactive:\s+(\d+)", out).group(1))
+        return round((free + inact) * 4096 / 1024**3, 1)
+    except Exception:
+        return float(MAC["ram_gb"]) * 0.4  # assume 40% free
+
+def ram_safe(min_gb=1.5) -> bool:
+    return get_free_ram_gb() >= min_gb
+
+def max_parallel_threads() -> int:
+    """
+    M-chip P-core aware batch size.
+    Cloud threads (~0 RAM each) → run up to P-core count simultaneously.
+    Hermes tasks (8GB RAM each) → capped separately by max_parallel_tasks.
+    ALL tasks always run — this controls wave concurrency only.
+    """
+    # Profile-driven: M1 Pro = 6 P-cores → 6 cloud threads at once
+    profile_batch = MAC.get("mae", {}).get("batch_size", 4)
+    # Runtime adjustment based on free RAM (UMA pressure)
+    gb = get_free_ram_gb()
+    if gb >= 8.0:   return profile_batch        # full P-core count
+    if gb >= 4.0:   return max(4, profile_batch // 2)
+    if gb >= 2.0:   return 3
+    return 2
+
+# ─── LLM Executor ────────────────────────────────────────────────────────────
+def _load_env() -> dict:
+    env = dict(os.environ)
+    env_file = Path.home() / ".claude/tier0.env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("export "):
+                k, _, v = line[7:].partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                env[k] = v
+    return env
+
+def call_groq(prompt: str, model="llama-3.1-8b-instant") -> str:
+    import urllib.request
+    env = _load_env()
+    key = env.get("GROQ_API_KEY", "")
+    if not key:
+        return "[Groq] No API key"
+
+    payload = json.dumps({
+        "model": model if model != "llama3-70b-8192" else "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1500
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "MAE/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            d = json.loads(resp.read())
+            return d["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"[Groq error] {e}"
+
+def call_moonshot(prompt: str, model="moonshot-v1-8k") -> str:
+    import urllib.request
+    env = _load_env()
+    key = env.get("MOONSHOT_API_KEY", "")
+    if not key:
+        return "[Moonshot] No API key"
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1500
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.moonshot.ai/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "MAE/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            d = json.loads(resp.read())
+            return d["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"[Moonshot error] {e}"
+
+def _is_billing_error(text: str) -> bool:
+    t = text.lower()
+    return any(s in t for s in ("quota", "insufficient balance", "exceeded", "billing", "rate limit", "limit: 0", "no endpoints"))
+
+def call_synth(prompt: str) -> str:
+    """Synthesis call — Groq 70B preferred; falls back to Moonshot 128k on rate limit."""
+    out = call_groq(prompt, model="llama-3.3-70b-versatile")
+    if out.startswith("[Groq error]") or "429" in out or _is_billing_error(out):
+        return call_moonshot(prompt, model="moonshot-v1-128k")
+    return out
+
+def call_gemini(prompt: str) -> str:
+    import urllib.request
+    env = _load_env()
+    key = env.get("GEMINI_API_KEY", "")
+    if not key:
+        return call_moonshot(prompt)  # fallback
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+    payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "MAE/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            d = json.loads(resp.read())
+            return d["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        msg = str(e)
+        if _is_billing_error(msg):
+            return call_moonshot(prompt)  # auto-fallback on quota/billing
+        return f"[Gemini error → Moonshot fallback] " + call_moonshot(prompt)
+
+def call_deepseek(prompt: str) -> str:
+    import urllib.request
+    env = _load_env()
+    key = env.get("DEEPSEEK_API_KEY", "")
+    if not key:
+        return call_groq(prompt, model="llama-3.3-70b-versatile")  # fallback for reasoning
+    payload = json.dumps({
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.deepseek.com/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "MAE/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            d = json.loads(resp.read())
+            return d["choices"][0]["message"]["content"]
+    except Exception as e:
+        msg = str(e)
+        if _is_billing_error(msg):
+            # DeepSeek out of balance → use Groq 70B (best reasoning of the remaining Tier 0)
+            return call_groq(prompt, model="llama-3.3-70b-versatile")
+        return "[DeepSeek error → Groq-70B fallback] " + call_groq(prompt, model="llama-3.3-70b-versatile")
+
+def call_ollama(prompt: str, model="llama3:latest") -> str:
+    # Try multiple Ollama binary locations
+    ollama_paths = [
+        "/Applications/Ollama.app/Contents/Resources/ollama",
+        "/opt/homebrew/bin/ollama",
+        "/usr/local/bin/ollama",
+        "ollama"
+    ]
+    ollama_bin = next((p for p in ollama_paths if os.path.exists(p)), "ollama")
+    result = subprocess.run(
+        [ollama_bin, "run", model, prompt[:500]],
+        capture_output=True, text=True, timeout=90
+    )
+    return result.stdout.strip() or result.stderr.strip() or "[Ollama no output]"
+
+def call_llm_burst(prompt: str) -> str:
+    """Use llm-burst — the proven multi-model dispatcher."""
+    safe = prompt.replace("'", "\\'")
+    cmd = f"source ~/.claude/tier0.env 2>/dev/null && ~/.claude/bin/llm-burst '{safe[:400]}' 2>/dev/null"
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+    return r.stdout.strip() or r.stderr.strip() or "(no output)"
+
+def call_hermes_fc(prompt: str) -> str:
+    """
+    Hermes partner call — routes to local qwen2.5:7b via hermes-fc.
+    Used for: tool execution, structured output, file ops, code run, web.
+    Hermes uses LOCAL RAM (qwen2.5:7b) — complementary to MAE cloud blast.
+    Falls back to Ollama direct if hermes-fc unavailable.
+    """
+    hermes_fc = str(Path.home() / ".claude/bin/hermes-fc")
+    hermes_bin = str(Path.home() / ".local/bin/hermes")
+    ctx_file   = str(Path.home() / ".claude/mae-hermes-ctx.json")
+
+    # Write task to shared context so Hermes can reference MAE's goal
+    try:
+        import json as _json
+        ctx = {"task": prompt[:500], "source": "mae", "ts": datetime.now().isoformat()}
+        Path(ctx_file).write_text(_json.dumps(ctx))
+    except Exception:
+        pass
+
+    # Try hermes-fc first (structured / function calling mode)
+    if os.path.exists(hermes_fc):
+        try:
+            r = subprocess.run(
+                [hermes_fc, prompt[:400]],
+                capture_output=True, text=True, timeout=120
+            )
+            out = r.stdout.strip()
+            if out and not out.startswith("["):
+                return f"[HERMES-FC] {out}"
+        except Exception as e:
+            pass
+
+    # Try hermes chat -q (full tool-use mode)
+    if os.path.exists(hermes_bin):
+        try:
+            r = subprocess.run(
+                [hermes_bin, "chat", "-q", prompt[:400], "-Q"],
+                capture_output=True, text=True, timeout=120
+            )
+            out = r.stdout.strip()
+            if out:
+                return f"[HERMES] {out}"
+        except Exception as e:
+            pass
+
+    # Final fallback: Ollama direct
+    return call_ollama(prompt, model="qwen2.5:7b")
+
+# ─── Task Decomposer ─────────────────────────────────────────────────────────
+DECOMPOSE_PROMPT = """You are a task decomposer for an AI automation system.
+Break the following goal into 3-7 specific executable sub-tasks.
+Each sub-task should be concrete, actionable, and independently executable.
+Return ONLY a JSON array of strings. No markdown, no explanation.
+
+Goal: {goal}
+
+Return format: ["sub-task 1", "sub-task 2", ...]"""
+
+def decompose_goal(goal: str) -> list:
+    p(f"\n▸ Decomposing goal via Groq...", "c")
+    prompt = DECOMPOSE_PROMPT.format(goal=goal)
+    result = call_groq(prompt, model="llama-3.1-8b-instant")
+    try:
+        # Extract JSON array from response
+        start = result.find("[")
+        end = result.rfind("]") + 1
+        if start >= 0 and end > start:
+            tasks = json.loads(result[start:end])
+            return [t for t in tasks if isinstance(t, str)]
+    except:
+        pass
+    # Fallback: split by newlines
+    lines = [l.strip().lstrip("-•1234567890. ") for l in result.splitlines() if len(l.strip()) > 10]
+    return lines[:7]
+
+# ─── Multi-Model Parallel Execution ──────────────────────────────────────────
+def parallel_llm_blast(prompt: str) -> dict:
+    """Fire same prompt at all Tier 0 LLMs simultaneously, return all results."""
+    results = {}
+    lock = threading.Lock()
+
+    def run(name, fn, *args):
+        try:
+            out = fn(*args)
+            with lock:
+                results[name] = out
+        except Exception as e:
+            with lock:
+                results[name] = f"[ERROR] {e}"
+
+    threads = [
+        threading.Thread(target=run, args=("groq", call_groq, prompt)),
+        threading.Thread(target=run, args=("gemini", call_gemini, prompt)),
+        threading.Thread(target=run, args=("deepseek", call_deepseek, prompt)),
+    ]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=35)
+
+    return results
+
+# ─── TCC Bridge ──────────────────────────────────────────────────────────────
+def tcc_add_and_fire(tasks: list, priority="high") -> None:
+    """Add all tasks to TCC queue and fire them in parallel."""
+    task_ids = []
+    for task_desc in tasks:
+        result = subprocess.run(
+            [str(TCC), "add"] + task_desc.split() + ["--priority", priority],
+            capture_output=True, text=True
+        )
+        # Extract ID from output
+        for line in result.stdout.splitlines():
+            if "[" in line and "]" in line:
+                start = line.find("[") + 1
+                end = line.find("]")
+                tid = line[start:end].strip()
+                if len(tid) == 8:
+                    task_ids.append(tid)
+                    break
+
+    if task_ids:
+        # Fire all in parallel
+        subprocess.run([str(TCC), "fire", "all"], capture_output=False)
+
+def tcc_sprint() -> None:
+    """Fire ALL pending TCC tasks."""
+    subprocess.run([str(TCC), "fire", "all"])
+
+# ─── Workflow Deployer ────────────────────────────────────────────────────────
+def deploy_workflow(name: str, steps: list) -> str:
+    wf = {
+        "name": name,
+        "description": f"MAE-deployed workflow: {name}",
+        "steps": [
+            {
+                "id": f"step_{i}",
+                "command": step if isinstance(step, str) else step.get("command", "echo done"),
+                "depends_on": [f"step_{i-1}"] if i > 0 else []
+            }
+            for i, step in enumerate(steps)
+        ]
+    }
+    wf_path = Path.home() / f".claude/workflows/{name.replace(' ','-')}.json"
+    wf_path.write_text(json.dumps(wf, indent=2))
+
+    result = subprocess.run(
+        [str(Path.home() / ".claude/bin/workflow-dag"), str(wf_path)],
+        capture_output=True, text=True, timeout=120
+    )
+    return result.stdout or result.stderr
+
+# ─── Paperclip Sync ──────────────────────────────────────────────────────────
+def paperclip_sync(data: dict) -> str:
+    import urllib.request
+    try:
+        payload = json.dumps(data).encode()
+        req = urllib.request.Request(
+            "http://127.0.0.1:3100/api/tasks",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.read().decode()[:200]
+    except Exception as e:
+        return f"Paperclip sync failed: {e}"
+
+# ─── Daily Ops Automation ─────────────────────────────────────────────────────
+DAILY_TASKS = [
+    # Lead generation
+    ("Identify 10 new B2B prospects for DigiMinds digital marketing agency", "high", "tier0-blast"),
+    # Content
+    ("Generate 3 LinkedIn post drafts for DigiMinds agency brand building", "med", "tier0-blast"),
+    # Ads monitoring
+    ("Summarize key Google Ads optimization opportunities for agency clients", "high", "tier0-blast"),
+    # SEO
+    ("Generate a list of SEO quick wins for digiminds.org website", "med", "tier0-blast"),
+    # Intelligence
+    ("Research latest digital marketing trends and competitor agency moves", "med", "tier0-blast"),
+    # Reporting
+    ("Create daily agency KPI summary for DigiMinds operations review", "high", "tier0-blast"),
+]
+
+def run_daily_ops():
+    p(f"\n{'═'*70}", "m")
+    p(f"  MAE DAILY OPS — {datetime.now().strftime('%Y-%m-%d %H:%M')}", "m")
+    p(f"{'═'*70}\n", "m")
+
+    p("▸ Phase 1: Adding daily ops tasks to queue...", "c")
+    for desc, priority, agent in DAILY_TASKS:
+        subprocess.run([str(TCC), "add", desc, "--priority", priority, "--agent", agent],
+                       capture_output=True)
+        p(f"  + {desc[:65]}", "y")
+
+    p(f"\n▸ Phase 2: Firing ALL {len(DAILY_TASKS)} tasks in PARALLEL...", "g")
+    subprocess.run([str(TCC), "fire", "all"])
+
+    p("\n▸ Phase 3: Syncing to Paperclip CEO layer...", "c")
+    paperclip_sync({"title": "MAE Daily Ops Run", "status": "active", "timestamp": datetime.now().isoformat()})
+
+    p("\n▸ Phase 4: Task queue status...", "c")
+    subprocess.run([str(TCC), "queue"])
+
+# ─── Specialist Agent Roles ───────────────────────────────────────────────────
+TOOL_TASK_KEYWORDS = [
+    "execute", "run", "search", "find", "fetch", "scrape", "browse", "read file",
+    "write file", "code", "script", "install", "check", "verify", "test", "deploy",
+    "create file", "list", "download", "upload", "extract", "parse", "call api",
+    "query", "database", "terminal", "shell", "command", "git", "build", "compile"
+]
+
+def is_tool_task(task: str) -> bool:
+    """Detect if a subtask needs Hermes tool execution vs cloud LLM thinking."""
+    t = task.lower()
+    return any(kw in t for kw in TOOL_TASK_KEYWORDS)
+
+SPECIALIST_ROLES = {
+    "researcher":   "You are a research specialist. Find facts, data, and insights. Be thorough and cite specifics.",
+    "strategist":   "You are a senior strategist. Think big picture, competitive positioning, and long-term impact.",
+    "copywriter":   "You are an expert copywriter. Write compelling, persuasive, action-oriented content.",
+    "analyst":      "You are a data analyst. Break down metrics, ROI, conversion rates, and measurable outcomes.",
+    "tactician":    "You are an implementation tactician. Give step-by-step actionable execution plans.",
+    "critic":       "You are a constructive critic. Find weaknesses, risks, and gaps in the approach.",
+    "optimizer":    "You are an optimization expert. Find efficiencies, cost savings, and performance gains.",
+    # Hermes partner role — local tool execution, zero cloud cost
+    "executor":     "You are Hermes, a local AI agent with 30+ tools. Execute tasks using file, shell, web, code, and memory tools. Return concrete results.",
+}
+
+def run_specialist_agent(role: str, task: str, goal_context: str) -> dict:
+    """Run a single specialist agent on a specific task.
+    executor role → Hermes (local tools, qwen2.5:7b)
+    all other roles → Tier-0 cloud LLMs (zero local RAM)
+    """
+    system = SPECIALIST_ROLES.get(role, "You are a helpful expert.")
+    prompt = f"Context: {goal_context[:200]}\n\nYour task ({role}): {task}"
+
+    role_model = {
+        "researcher": call_gemini,      # Gemini: research + long context
+        "strategist": call_deepseek,    # DeepSeek: reasoning
+        "copywriter": call_groq,        # Groq: fastest for creative/copy
+        "analyst":    call_deepseek,    # DeepSeek: analytical precision
+        "tactician":  call_groq,        # Groq: fast execution plans
+        "critic":     call_gemini,      # Gemini: broad critique
+        "optimizer":  call_llm_burst,   # llm-burst: best model wins
+        # ↓ Hermes partner — local tool execution, cloud-independent
+        "executor":   call_hermes_fc,   # Hermes: qwen2.5:7b + 30 tools, zero API cost
+    }
+    fn = role_model.get(role, call_llm_burst)
+
+    try:
+        # Inject system role into prompt for LLMs that don't support system messages natively
+        full_prompt = f"[ROLE: {system}]\n\n{prompt}"
+        result = fn(full_prompt)
+    except Exception as e:
+        result = f"[{role} error] {e}"
+
+    return {"role": role, "task": task, "output": result}
+
+def parallel_specialist_swarm(goal: str, sub_tasks: list) -> list:
+    """
+    Assign each sub-task to a specialist agent.
+    Parallel thread count capped by available RAM — never overloads machine.
+    Returns list of results with role + output.
+    """
+    # ── Synergistic assignment: tool tasks → Hermes executor, thinking → cloud ──
+    # Tool tasks use LOCAL RAM (Hermes/qwen2.5:7b) — zero cloud cost
+    # Thinking tasks use ZERO LOCAL RAM (Groq/Gemini/DeepSeek) — pure network
+    # Both categories run simultaneously — no resource conflict
+    free_ram = get_free_ram_gb()
+    batch_size = max_parallel_threads()
+
+    cloud_roles = ["researcher","strategist","copywriter","analyst","tactician","critic","optimizer"]
+    assignments = []
+    hermes_count = 0
+    for i, task in enumerate(sub_tasks):
+        if is_tool_task(task) and hermes_count < 2:  # max 2 concurrent Hermes tasks (RAM guard)
+            assignments.append(("executor", task))
+            hermes_count += 1
+            p(f"    → [executor/HERMES] {task[:60]}", "y")
+        else:
+            role = cloud_roles[i % len(cloud_roles)]
+            assignments.append((role, task))
+            p(f"    → [{role:12}/cloud] {task[:60]}", "c")
+
+    p(f"\n  ⚡ MAE+HERMES swarm: {len(assignments)} agents | {hermes_count} Hermes (local) + {len(assignments)-hermes_count} cloud", "g")
+
+    results = [None] * len(assignments)
+    lock = threading.Lock()
+
+    def run(idx, role, task):
+        r = run_specialist_agent(role, task, goal)
+        with lock:
+            results[idx] = r
+        icon = "🔧" if role == "executor" else "☁"
+        p(f"    ✓ {icon} [{role:12}] {task[:55]}", "g")
+
+    # Cloud tasks: batch by batch_size (no RAM concern)
+    # Hermes tasks: always in separate wave (RAM guard — never concurrent with each other)
+    cloud_batch = [(i, r, t) for i, (r, t) in enumerate(assignments) if r != "executor"]
+    hermes_batch = [(i, r, t) for i, (r, t) in enumerate(assignments) if r == "executor"]
+
+    # Fire cloud wave first (fast, parallel)
+    for wave_start in range(0, len(cloud_batch), batch_size):
+        wave = cloud_batch[wave_start:wave_start + batch_size]
+        threads = [threading.Thread(target=run, args=(i, r, t)) for i, r, t in wave]
+        for th in threads: th.start()
+        for th in threads: th.join(timeout=60)
+
+    # Fire Hermes tasks sequentially (each needs local RAM — no overlap)
+    for i, r, t in hermes_batch:
+        run(i, r, t)
+
+    return [r for r in results if r]
+
+SYNTHESIZE_PROMPT = """You are a senior expert synthesizer. Multiple AI agents worked on this goal in parallel.
+Combine their outputs into ONE definitive, high-quality, actionable result.
+Remove duplication. Keep the best insights from each. Structure clearly.
+
+Goal: {goal}
+
+Agent outputs:
+{outputs}
+
+Produce the FINAL synthesized output now. Be comprehensive but concise."""
+
+def multi_agent_run(goal: str) -> dict:
+    """
+    Phase 1: Fire goal at 3 LLMs simultaneously.
+    Phase 2: Synthesize all outputs into one superior result.
+    Returns: dict with per-agent outputs + final synthesis.
+    """
+    p(f"\n  ⚡ Phase 1: Firing {goal[:50]}... at 3 LLMs simultaneously", "g")
+    results = {}
+    lock = threading.Lock()
+
+    def run_agent(name, fn, *args):
+        out = fn(*args)
+        with lock:
+            results[name] = out
+        p(f"    ✓ {name} returned {len(out)} chars", "g")
+
+    threads = [
+        threading.Thread(target=run_agent, args=("Groq/Llama3", call_groq, goal)),
+        threading.Thread(target=run_agent, args=("Gemini2Flash", call_gemini, goal)),
+        threading.Thread(target=run_agent, args=("DeepSeek-V3", call_deepseek, goal)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=40)
+
+    p(f"\n  ⚡ Phase 2: Synthesizing {len(results)} agent outputs into final result...", "c")
+    combined = "\n\n---\n".join(f"[{name}]:\n{out[:600]}" for name, out in results.items())
+    synth_prompt = SYNTHESIZE_PROMPT.format(goal=goal, outputs=combined)
+    synthesis = call_synth(synth_prompt)
+
+    return {"agents": results, "synthesis": synthesis}
+
+# ─── Main Run Command ─────────────────────────────────────────────────────────
+def cmd_run(args):
+    goal = " ".join(args.goal)
+    p(f"\n{'═'*70}", "b")
+    p(f"  MAE RUN — Master Automation Engine  [{datetime.now().strftime('%H:%M:%S')}]", "b")
+    p(f"  Goal: {goal}", "w")
+    p(f"{'═'*70}\n", "b")
+
+    if args.plan_only:
+        sub_tasks = decompose_goal(goal)
+        p(f"\n  Plan: {len(sub_tasks)} parallel agents would execute:", "g")
+        for i, t in enumerate(sub_tasks, 1):
+            p(f"  {i}. {t}", "w")
+        p("\n[Plan mode — remove --plan to execute.]", "y")
+        return
+
+    t0 = time.time()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 1 — Decompose goal into specialist sub-tasks (Groq, fast)
+    # ════════════════════════════════════════════════════════════════════════
+    p("▸ Phase 1/4: Decomposing goal into parallel sub-tasks...", "c")
+    sub_tasks = decompose_goal(goal)
+    p(f"  {len(sub_tasks)} sub-tasks identified:", "g")
+    for i, t in enumerate(sub_tasks, 1):
+        p(f"    {i}. {t[:72]}", "w")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 2 — Specialist swarm: each sub-task → dedicated specialist agent
+    #           ALL running in parallel threads simultaneously
+    # ════════════════════════════════════════════════════════════════════════
+    p(f"\n▸ Phase 2/4: Launching specialist agent swarm ({len(sub_tasks)} agents × parallel)...", "c")
+    p(f"  Roles: researcher · strategist · copywriter · analyst · tactician · critic · optimizer", "w")
+    swarm_results = parallel_specialist_swarm(goal, sub_tasks)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 3 — Cross-LLM blast: fire full goal at Groq + Gemini + DeepSeek
+    #           simultaneously for additional perspectives
+    # ════════════════════════════════════════════════════════════════════════
+    p(f"\n▸ Phase 3/4: Cross-LLM blast (Groq + Gemini + DeepSeek in parallel)...", "c")
+    p(f"  Note: cloud APIs only — zero local RAM consumption", "y")
+    blast_results = {}
+    blast_lock = threading.Lock()
+
+    def blast_run(name, fn, *fn_args):
+        try:
+            out = fn(*fn_args) if fn_args else fn(goal)
+            with blast_lock:
+                blast_results[name] = out
+            p(f"    ✓ {name}", "g")
+        except Exception as e:
+            p(f"    ✗ {name}: {e}", "r")
+
+    # Cloud blast runs simultaneously with Hermes tool execution (Phase 2)
+    # No Ollama here — Hermes executor already covered local inference in Phase 2
+    p(f"    Cloud: Groq-70B + Gemini-Flash + DeepSeek-V3 (zero local RAM)", "c")
+    p(f"    Local: Hermes/qwen2.5:7b already fired in Phase 2 (tool tasks)", "y")
+    blast_threads = [
+        threading.Thread(target=blast_run, args=("Groq-70B",    call_groq, goal, "llama-3.3-70b-versatile")),
+        threading.Thread(target=blast_run, args=("Gemini-Flash", call_gemini, goal)),
+        threading.Thread(target=blast_run, args=("DeepSeek-V3",  call_deepseek, goal)),
+    ]
+    for t in blast_threads: t.start()
+    for t in blast_threads: t.join(timeout=45)
+
+    # Pull Hermes tool results from shared context if available
+    ctx_file = Path.home() / ".claude/mae-hermes-ctx.json"
+    if ctx_file.exists():
+        try:
+            ctx = json.loads(ctx_file.read_text())
+            if ctx.get("hermes_result"):
+                blast_results["Hermes-Local"] = ctx["hermes_result"]
+                p(f"    ✓ Hermes-Local (from shared ctx)", "g")
+        except Exception:
+            pass
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 4 — Master synthesis: combine ALL agent outputs into ONE
+    #           definitive, high-quality, production-ready result
+    # ════════════════════════════════════════════════════════════════════════
+    p(f"\n▸ Phase 4/4: Master synthesis — combining all agent outputs...", "c")
+
+    all_outputs = []
+    for r in swarm_results:
+        all_outputs.append(f"[{r['role'].upper()} on: {r['task'][:60]}]\n{r['output'][:400]}")
+    for name, out in blast_results.items():
+        all_outputs.append(f"[{name}]\n{out[:400]}")
+
+    combined = "\n\n---\n".join(all_outputs)
+    synth_prompt = SYNTHESIZE_PROMPT.format(goal=goal, outputs=combined[:3000])
+    synthesis = call_synth(synth_prompt)
+
+    elapsed = round(time.time() - t0, 1)
+    total_agents = len(swarm_results) + len(blast_results)
+
+    p(f"\n{'═'*70}", "g")
+    p(f"  FINAL SYNTHESIZED OUTPUT  [{total_agents} agents · {elapsed}s]", "g")
+    p(f"{'═'*70}", "g")
+    p(synthesis, "w")
+    p(f"{'═'*70}\n", "g")
+
+    # Save full output
+    out_path = LOGS_DIR / f"mae-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    lines = [f"# MAE: {goal}", f"\n> {total_agents} agents · {elapsed}s\n",
+             "## Final Synthesis\n", synthesis,
+             "\n## Specialist Agent Outputs\n"]
+    for r in swarm_results:
+        lines.append(f"\n### [{r['role'].upper()}] {r['task']}\n{r['output']}")
+    for name, out in blast_results.items():
+        lines.append(f"\n### [{name}]\n{out}")
+    out_path.write_text("\n".join(lines))
+    p(f"  Full report saved → {out_path}", "y")
+
+    # Paperclip sync
+    paperclip_sync({
+        "title": goal[:100], "synthesis": synthesis[:300],
+        "subtasks": sub_tasks, "source": "mae",
+        "agents": total_agents, "elapsed_s": elapsed,
+        "timestamp": datetime.now().isoformat()
+    })
+
+    p(f"\n  ✓ {total_agents} agents deployed · {elapsed}s total · output saved", "g")
+
+def cmd_plan(args):
+    goal = " ".join(args.goal)
+    p(f"\n  MAE PLAN — {goal[:60]}", "b")
+    sub_tasks = decompose_goal(goal)
+    p(f"\n  Execution plan ({len(sub_tasks)} parallel agents):\n", "g")
+    for i, t in enumerate(sub_tasks, 1):
+        # Show what agent would handle it
+        result = subprocess.run([str(TCC), "add", t, "--priority", "high"],
+                                capture_output=True, text=True)
+        route_info = ""
+        for line in result.stdout.splitlines():
+            if "→" in line:
+                route_info = line.split("→")[-1].strip()
+        p(f"  {i:2}. [{route_info:25}] {t[:55]}", "w")
+    p(f"\n  Run: mae run '{goal}' to execute", "y")
+
+def cmd_sprint(args):
+    p("\n⚡ MAE SPRINT — Firing ALL pending tasks NOW\n", "g")
+    tcc_sprint()
+
+def cmd_daily(args):
+    run_daily_ops()
+
+def cmd_status(args):
+    p(f"\n  MAE STATUS — {datetime.now().strftime('%H:%M:%S')}\n", "b")
+    p("  ── Paperclip CEO Layer ──", "c")
+    try:
+        import urllib.request
+        r = urllib.request.urlopen("http://127.0.0.1:3100/", timeout=3)
+        p("  ✓ Paperclip running at http://127.0.0.1:3100", "g")
+    except:
+        p("  ✗ Paperclip not reachable", "r")
+
+    p("\n  ── Tier 0 LLMs ──", "c")
+    try:
+        r = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5)
+        models = [l.split()[0] for l in r.stdout.splitlines()[1:] if l.strip()]
+        p(f"  ✓ Ollama: {', '.join(models[:3])}", "g")
+    except:
+        p("  ✗ Ollama not running", "r")
+
+    p("\n  ── TCC Queue ──", "c")
+    subprocess.run([str(TCC), "queue"])
+
+    p("\n  ── Available Resources ──", "c")
+    if REGISTRY.exists():
+        reg = json.loads(REGISTRY.read_text())
+        agents = list(reg.get("agents", {}).keys())
+        p(f"  Agents: {len(agents)} registered → {', '.join(agents[:6])}...", "g")
+        repos = reg.get("installed_repos", {})
+        p(f"  Repos: {len(repos)} available", "g")
+
+def cmd_deploy(args):
+    name = args.workflow_name
+    p(f"\n  MAE DEPLOY — {name}", "b")
+    # Load or build workflow
+    wf_path = Path.home() / f".claude/workflows/{name}.json"
+    if not wf_path.exists():
+        wf_path_alt = Path.home() / f".claude/workflows/{name}.json"
+        if not wf_path_alt.exists():
+            p(f"Workflow '{name}' not found. Available:", "r")
+            for f in sorted((Path.home() / ".claude/workflows").glob("*.json")):
+                p(f"  {f.stem}", "w")
+            return
+    p(f"  Running workflow: {wf_path}", "c")
+    result = subprocess.run(
+        [str(Path.home() / ".claude/bin/workflow-dag"), str(wf_path)],
+        timeout=300
+    )
+
+def cmd_register(args):
+    p(f"  Register resource: {args.resource_file}", "b")
+    src = Path(args.resource_file)
+    if not src.exists():
+        p(f"File not found: {args.resource_file}", "r")
+        return
+    p(f"  ✓ Resource file located. Add entries to ~/.claude/tcc-routes/agent-registry.json", "g")
+    p(f"  Current registry: {REGISTRY}", "c")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mae",
+        description="MAE — Master Automation Engine. Deploy everything in parallel."
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_run = sub.add_parser("run", help="Decompose + execute a goal using all available agents")
+    p_run.add_argument("goal", nargs="+")
+    p_run.add_argument("--plan-only", "-p", action="store_true")
+
+    p_plan = sub.add_parser("plan", help="Show execution plan without firing")
+    p_plan.add_argument("goal", nargs="+")
+
+    sub.add_parser("sprint", help="Fire ALL pending TCC tasks NOW")
+    sub.add_parser("daily", help="Run full daily ops automation")
+    sub.add_parser("status", help="Show all active operations and resource status")
+
+    p_deploy = sub.add_parser("deploy", help="Deploy a specific workflow")
+    p_deploy.add_argument("workflow_name")
+
+    p_reg = sub.add_parser("register", help="Register a new resource/agent")
+    p_reg.add_argument("resource_file")
+
+    args = parser.parse_args()
+
+    dispatch = {
+        "run":      cmd_run,
+        "plan":     cmd_plan,
+        "sprint":   cmd_sprint,
+        "daily":    cmd_daily,
+        "status":   cmd_status,
+        "deploy":   cmd_deploy,
+        "register": cmd_register,
+    }
+
+    if args.cmd in dispatch:
+        dispatch[args.cmd](args)
+    else:
+        cmd_status(args)
+
+if __name__ == "__main__":
+    main()

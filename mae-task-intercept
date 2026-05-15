@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# mae-task-intercept — UserPromptSubmit hook
+# Intercepts every user prompt. If it looks like a task/goal, registers it
+# in TCC automatically (non-blocking — does NOT delay Claude's response).
+# Also injects MAE instructions into session context.
+
+source ~/.claude/tier0.env 2>/dev/null
+
+PROMPT="${CLAUDE_TOOL_INPUT:-}"
+# Also try reading from stdin if hook framework passes it
+if [ -z "$PROMPT" ]; then
+    PROMPT=$(cat 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('prompt', d.get('message', d.get('input',''))))
+except:
+    pass
+" 2>/dev/null || echo "")
+fi
+
+# ── RAM check — NEVER run heavy work if < 2GB free ──────────────
+RAM_FREE_GB=$(python3 -c "
+import subprocess, re
+try:
+    out = subprocess.check_output(['vm_stat']).decode()
+    free  = int(re.search(r'Pages free:\s+(\d+)', out).group(1))
+    inact = int(re.search(r'Pages inactive:\s+(\d+)', out).group(1))
+    print(f'{(free + inact) * 4096 / 1024**3:.1f}')
+except: print('4.0')
+" 2>/dev/null || echo "4.0")
+
+RAM_OK=$(python3 -c "print('yes' if float('${RAM_FREE_GB}') >= 1.5 else 'no')" 2>/dev/null)
+
+# ── Inject MAE default behavior instruction ──────────────────────
+cat << 'INJECT'
+[MAE — MASTER AUTOMATION ENGINE — DEFAULT FOR ALL TASKS]
+For any task, deliverable, or goal the user asks for:
+  1. ALWAYS use mae run "goal" OR tcc blast for parallel multi-agent execution
+  2. NEVER execute tasks single-threaded when parallel agents are available
+  3. Route: research→Groq/Gemini · code→DeepSeek · content→GPT4o-mini · synthesis→Groq70B
+  4. Specialist swarm: researcher+strategist+copywriter+analyst+tactician+critic+optimizer
+  5. RAM guard: wave-batch threads by RAM — Ollama always runs, just queued after cloud wave
+  6. All task outputs auto-saved to ~/.claude/tcc-logs/
+  7. Paperclip CEO layer auto-synced on every mae run
+
+[HERMES AUTO-ROUTE] For tasks matching: tool use / agent / orchestrate / function call / local LLM / persistent memory / self-evolve
+  → Run: ~/.claude/bin/hermes-orchestrator "task" --mode auto
+  → Or direct: ~/.local/bin/hermes chat -q "task" -Q
+  → Model: Ollama qwen2.5:7b (local, 128K ctx, zero cost) → OpenRouter → Groq fallback
+  → Deactivate when done: ~/.claude/bin/hermes-deactivate
+
+[LAUNCH-OPTIMIZED ROUTE] For full-stack agency tasks / audits / launch-optimized:
+  → run: ~/.claude/bin/launch-hermes-bridge "task" --mode auto
+  → Pipeline: MAE Tier0 blast + Hermes tool execution + TCC logging
+  → One command fires: decompose → specialist swarm → hermes tools → output ~/Downloads/
+
+RAM: ${RAM_FREE_GB}GB free | MAE: ACTIVE | TCC: ACTIVE | HERMES: qwen2.5:7b local
+INJECT
+
+# launch-optimized → bridge → hermes + MAE
+if echo "$PROMPT" | grep -qiE "launch.?optimized|/launch|full.?audit|360.?audit|bdm.?sweep|agency.?task"; then
+  (~/.claude/bin/launch-hermes-bridge "$PROMPT" --mode auto >/dev/null 2>&1 &)
+fi
+
+# Hermes routing — tool-use and agent tasks
+if echo "$PROMPT" | grep -qiE "hermes|tool.?use|orchestrate|self.?evolv|local.?agent|function.?call.*local|agent.*memory|persistent.*memory|evolve.*skill"; then
+  (~/.claude/bin/hermes-activate >/dev/null 2>&1 &)
+fi
+
+# MAE run → always warm hermes as execution layer
+if echo "$PROMPT" | grep -qiE "^mae run|mae.?orchestrate|mae.?deploy|/hermes"; then
+  (~/.claude/bin/hermes-activate >/dev/null 2>&1 &)
+fi
+
+# ── Background: register prompt as TCC task if task-like ─────────
+# (completely non-blocking — spawns detached process)
+if [ -n "$PROMPT" ] && [ ${#PROMPT} -gt 20 ] && [ "$RAM_OK" = "yes" ]; then
+    python3 -c "
+import subprocess, sys, re
+prompt = sys.argv[1]
+# Detect task-like prompts (not questions, not short chats)
+task_signals = ['build','create','write','generate','analyze','research','draft',
+                'design','implement','optimize','audit','report','plan','launch',
+                'set up','make','run','execute','deploy','fix','improve','develop']
+is_task = any(s in prompt.lower() for s in task_signals) and len(prompt) > 30
+if is_task:
+    subprocess.Popen(
+        ['/Users/mc/.claude/bin/tcc', 'add', prompt[:200], '--priority', 'med'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+" "$PROMPT" 2>/dev/null &
+fi

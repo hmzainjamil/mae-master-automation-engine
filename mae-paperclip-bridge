@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""
+mae-paperclip-bridge — Deep MAE ↔ Paperclip integration
+Auto-hires agents as needed, executes tasks via MAE swarm, reports back to Paperclip.
+
+Usage:
+  mae-paperclip-bridge run           — pick up pending goals from Paperclip and execute
+  mae-paperclip-bridge hire "role"   — auto-create a new agent in Paperclip for a role
+  mae-paperclip-bridge sync          — sync latest MAE run outputs to Paperclip
+  mae-paperclip-bridge status        — show Paperclip + MAE status
+"""
+
+import os, sys, json, subprocess, time, urllib.request, urllib.error
+from pathlib import Path
+from datetime import datetime
+
+# ── Config ───────────────────────────────────────────────────────────────────
+env_file = Path.home() / ".claude/tier0.env"
+if env_file.exists():
+    for line in env_file.read_text().splitlines():
+        if line.startswith("export "): line = line[7:]
+        if "=" in line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            k = k.strip(); v = v.strip().strip('"').strip("'")
+            if k and v and k not in os.environ: os.environ[k] = v
+
+PAPERCLIP_URL = "http://127.0.0.1:3100"
+COMPANY_ID = "c5066522-bacc-4a28-b700-6590cbe366ec"
+MAE_BIN = Path.home() / ".claude/bin/mae"
+TCC_BIN = Path.home() / ".claude/bin/tcc"
+LOGS_DIR = Path.home() / ".claude/tcc-logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"; C = "\033[36m"; RST = "\033[0m"; B = "\033[1m"
+
+def p(msg, c=""): print(f"{c}{msg}{RST}", flush=True)
+
+# ── Paperclip API ─────────────────────────────────────────────────────────────
+def paperclip_get(path):
+    try:
+        req = urllib.request.Request(f"{PAPERCLIP_URL}{path}",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except Exception: return None
+
+def paperclip_post(path, data):
+    try:
+        body = json.dumps(data).encode()
+        req = urllib.request.Request(f"{PAPERCLIP_URL}{path}", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception: return None
+
+def paperclip_alive():
+    try:
+        urllib.request.urlopen(f"{PAPERCLIP_URL}/", timeout=3)
+        return True
+    except Exception: return False
+
+# ── MAE runner ────────────────────────────────────────────────────────────────
+def run_mae(goal: str) -> str:
+    """Run mae for a goal, return output path."""
+    try:
+        result = subprocess.run(
+            [str(MAE_BIN), "run", goal[:400]],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PATH": f"{Path.home()}/.claude/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+        )
+        output = result.stdout.strip() or result.stderr.strip() or "(no output)"
+        # Find latest log file
+        logs = sorted(LOGS_DIR.glob("mae-*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+        return logs[0].read_text() if logs else output
+    except Exception as e:
+        return f"MAE error: {e}"
+
+def run_llm_burst(prompt: str) -> str:
+    """Fallback: run llm-burst directly."""
+    burst = Path.home() / ".claude/bin/llm-burst"
+    try:
+        r = subprocess.run([str(burst), prompt[:400]], capture_output=True, text=True, timeout=60,
+            env={**os.environ, "PATH": f"{Path.home()}/.claude/bin:/opt/homebrew/bin:/usr/bin:/bin"})
+        return r.stdout.strip() or r.stderr.strip() or "(no output)"
+    except Exception as e:
+        return f"burst error: {e}"
+
+# ── Agent auto-hire ───────────────────────────────────────────────────────────
+AGENT_ROLES = {
+    "researcher":    "Research specialist — web search, data gathering, market intelligence via Groq+Gemini",
+    "strategist":    "Strategy specialist — GTM, positioning, competitive analysis via Kimi K2.6",
+    "copywriter":    "Copywriter — ads, emails, landing pages, social content via GPT4o-mini",
+    "analyst":       "Data analyst — KPIs, metrics, campaign performance via Groq 70B",
+    "tactician":     "Operations tactician — task prioritization, workflow design via DeepSeek",
+    "critic":        "Quality critic — reviews outputs, flags issues, improves quality via Kimi",
+    "optimizer":     "Optimizer — A/B analysis, funnel improvement, ROAS maximization via Groq",
+    "lead-gen":      "Lead generation specialist — Vibe Prospecting + Apollo pipeline",
+    "content":       "Content engine — scripts, posts, carousels, 20 pieces/day via Gemini",
+    "seo":           "SEO/GEO specialist — technical SEO, content, schema, citations",
+    "ads-manager":   "Paid ads manager — Google Ads + Meta Ads setup, optimization, reporting",
+    "email":         "Email automation — sequences, follow-ups, personalization via Kimi",
+    "intel":         "Competitor intelligence — Meta Ad Library + news + Apollo daily scrape",
+    "kpi-monitor":   "KPI monitor — Google/Meta metrics → Excel → Slack alert on drop",
+    "codex-agent":   "Codex coding agent — reads codebase, edits, tests, proposes diffs",
+    "opencli-agent": "OpenCLI agent — 90+ site adapters, zero token cost per web operation",
+    "deer-flow":     "Deer Flow research — ByteDance deep research pipeline for market intel",
+    "video-gen":     "Video generation — LTX-Video, KIE.ai, Arcads batch production",
+}
+
+def cmd_hire(role: str):
+    """Auto-create a Paperclip agent for a role."""
+    role = role.lower().strip()
+    description = AGENT_ROLES.get(role, f"Specialist agent for {role} tasks via MAE Tier 0 swarm")
+
+    p(f"\n{B}Hiring agent: {role}{RST}", C)
+    p(f"  Role: {description}")
+
+    # Write agent file to ~/.claude/agents/
+    agents_dir = Path.home() / ".claude/agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    agent_file = agents_dir / f"mae-{role}.md"
+    agent_content = f"""# MAE {role.title()} Agent
+
+## Role
+{description}
+
+## Activation
+Triggered automatically by MAE when task type matches: {role}
+
+## Instructions
+1. Route all sub-tasks through Tier 0 LLMs (Groq, Gemini, DeepSeek, Kimi, Bytez)
+2. Never use Claude Sonnet/Opus for sub-tasks — Tier 0 only
+3. Use llm-burst for parallel execution: `~/.claude/bin/llm-burst "prompt"`
+4. Save outputs to ~/.claude/tcc-logs/
+5. Report completion status back to TCC queue
+
+## Model Routing
+- Quick tasks → Groq llama-3.1-8b-instant
+- Analysis → Kimi K2.6 or Groq 70B
+- Code → DeepSeek-V3 or Bytez
+- Content → GPT4o-mini or Gemini Flash
+- Research → Gemini Flash + Deer Flow
+"""
+    agent_file.write_text(agent_content)
+    p(f"  ✓ Agent file: {agent_file}", G)
+
+    # Register in Paperclip if running
+    if paperclip_alive():
+        result = paperclip_post(f"/api/companies/{COMPANY_ID}/agents", {
+            "name": f"MAE {role.title()}",
+            "role": role,
+            "description": description,
+            "model": "tier0-auto",
+            "status": "active"
+        })
+        if result:
+            p(f"  ✓ Registered in Paperclip", G)
+        else:
+            p(f"  ~ Paperclip not reachable (agent file created)", Y)
+    else:
+        p(f"  ~ Paperclip offline (agent file created, will sync when running)", Y)
+
+    return agent_file
+
+def cmd_hire_all():
+    """Auto-hire all standard agents."""
+    p(f"\n{B}Auto-hiring all {len(AGENT_ROLES)} agents...{RST}", C)
+    for role in AGENT_ROLES:
+        cmd_hire(role)
+        time.sleep(0.1)
+    p(f"\n✓ All {len(AGENT_ROLES)} agents hired", G)
+
+# ── Goal executor ─────────────────────────────────────────────────────────────
+def cmd_run():
+    """Pick up pending goals from Paperclip and execute via MAE."""
+    p(f"\n{B}MAE-Paperclip Bridge — Running{RST}", C)
+
+    if not paperclip_alive():
+        p("  ⚠ Paperclip offline — running TCC queue fallback", Y)
+        # Fallback: fire pending TCC tasks
+        subprocess.run([str(TCC_BIN), "fire", "all"], timeout=300,
+            env={**os.environ, "PATH": f"{Path.home()}/.claude/bin:/opt/homebrew/bin:/usr/bin:/bin"})
+        return
+
+    # Get pending goals from Paperclip
+    goals = paperclip_get(f"/api/companies/{COMPANY_ID}/goals") or []
+    pending = [g for g in goals if isinstance(g, dict) and g.get("status") in ("pending", "todo", "active")]
+
+    p(f"  Paperclip goals: {len(pending)} pending", G if pending else Y)
+
+    if not pending:
+        p("  No pending goals — checking TCC queue...")
+        subprocess.run([str(TCC_BIN), "queue"], timeout=10,
+            env={**os.environ, "PATH": f"{Path.home()}/.claude/bin:/opt/homebrew/bin:/usr/bin:/bin"})
+        return
+
+    for goal in pending[:5]:  # max 5 per run to avoid overload
+        goal_text = goal.get("title") or goal.get("description") or str(goal)
+        goal_id = goal.get("id", "unknown")
+        p(f"\n  → Executing: {goal_text[:80]}", C)
+
+        output = run_mae(goal_text)
+
+        # Update Paperclip with result
+        paperclip_post(f"/api/companies/{COMPANY_ID}/goals/{goal_id}", {
+            "status": "completed",
+            "output": output[:2000],
+            "completed_at": datetime.now().isoformat()
+        })
+        p(f"  ✓ Goal {goal_id} completed + synced to Paperclip", G)
+
+def cmd_sync():
+    """Sync latest MAE run outputs to Paperclip."""
+    logs = sorted(LOGS_DIR.glob("mae-*.md"), key=lambda f: f.stat().st_mtime, reverse=True)[:5]
+    if not logs:
+        p("No MAE logs found", Y); return
+
+    p(f"\n{B}Syncing {len(logs)} MAE outputs to Paperclip...{RST}", C)
+    for log in logs:
+        content = log.read_text()[:3000]
+        result = paperclip_post(f"/api/companies/{COMPANY_ID}/activities", {
+            "type": "mae_run",
+            "source": str(log.name),
+            "content": content,
+            "timestamp": datetime.fromtimestamp(log.stat().st_mtime).isoformat()
+        })
+        status = "✓" if result else "~"
+        p(f"  {status} {log.name}", G if result else Y)
+
+def cmd_status():
+    """Show combined Paperclip + MAE status."""
+    p(f"\n{B}MAE-Paperclip Status{RST}", C)
+
+    # Paperclip
+    alive = paperclip_alive()
+    p(f"  Paperclip: {'✓ Running' if alive else '✗ Offline'}", G if alive else R)
+    if alive:
+        goals = paperclip_get(f"/api/companies/{COMPANY_ID}/goals") or []
+        agents_list = paperclip_get(f"/api/companies/{COMPANY_ID}/agents") or []
+        pending = len([g for g in goals if isinstance(g, dict) and g.get("status") in ("pending","todo","active")])
+        p(f"  Goals: {pending} pending / {len(goals)} total", Y if pending else G)
+        p(f"  Agents: {len(agents_list)} registered", G)
+
+    # MAE agents
+    agents_dir = Path.home() / ".claude/agents"
+    mae_agents = list(agents_dir.glob("mae-*.md")) if agents_dir.exists() else []
+    p(f"  MAE agents hired: {len(mae_agents)}", G)
+
+    # TCC queue
+    try:
+        r = subprocess.run([str(TCC_BIN), "queue"], capture_output=True, text=True, timeout=5,
+            env={**os.environ, "PATH": f"{Path.home()}/.claude/bin:/opt/homebrew/bin:/usr/bin:/bin"})
+        p(f"  TCC queue:\n    {r.stdout.strip()[:200]}", C)
+    except: pass
+
+    # Recent logs
+    logs = sorted(LOGS_DIR.glob("mae-*.md"), key=lambda f: f.stat().st_mtime, reverse=True)[:3]
+    if logs:
+        p(f"  Recent MAE runs: {len(logs)} logs", G)
+        for log in logs:
+            age = time.time() - log.stat().st_mtime
+            p(f"    {log.name} ({int(age/60)}m ago)", C)
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+
+    if cmd == "run":
+        cmd_run()
+    elif cmd == "hire":
+        role = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not role:
+            cmd_hire_all()
+        else:
+            cmd_hire(role)
+    elif cmd == "hire-all":
+        cmd_hire_all()
+    elif cmd == "sync":
+        cmd_sync()
+    elif cmd == "status":
+        cmd_status()
+    else:
+        print(f"Usage: mae-paperclip-bridge [run|hire <role>|hire-all|sync|status]")

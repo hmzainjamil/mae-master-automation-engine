@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# mae-stop-sync — Stop hook
+# At end of every session: auto-completes any lingering active TCC tasks,
+# saves session summary, purges stale active tasks (crashed mid-run).
+
+source ~/.claude/tier0.env 2>/dev/null
+
+# Reset any tasks stuck in "active" state (session ended = they're done or abandoned)
+python3 -c "
+from pathlib import Path
+import json
+from datetime import datetime
+
+tasks_dir = Path.home() / '.claude/tasks'
+if not tasks_dir.exists():
+    exit()
+
+reset = 0
+for f in tasks_dir.glob('*.json'):
+    try:
+        t = json.loads(f.read_text())
+        if t.get('status') == 'active':
+            # If active for more than 5 min, mark as failed (timeout)
+            started = t.get('started')
+            if started:
+                from datetime import datetime
+                age = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
+                if age > 300:
+                    t['status'] = 'failed'
+                    t['result'] = '[timeout — session ended]'
+                    f.write_text(json.dumps(t, indent=2))
+                    reset += 1
+    except:
+        pass
+
+if reset:
+    print(f'[mae-stop-sync] Reset {reset} timed-out active tasks')
+" 2>/dev/null
+
+# Write session queue summary to tcc-logs
+python3 -c "
+from pathlib import Path
+import json
+from datetime import datetime
+
+tasks_dir = Path.home() / '.claude/tasks'
+if not tasks_dir.exists():
+    exit()
+
+counts = {}
+for f in tasks_dir.glob('*.json'):
+    try:
+        t = json.loads(f.read_text())
+        s = t.get('status','unknown')
+        counts[s] = counts.get(s,0) + 1
+    except:
+        pass
+
+log = Path.home() / '.claude/tcc-logs/session-summary.log'
+entry = f\"{datetime.now().isoformat()[:19]} | \" + \" · \".join(f'{k}:{v}' for k,v in counts.items())
+existing = log.read_text() if log.exists() else ''
+log.write_text(entry + '\n' + existing[:5000])
+print(f'[mae-stop-sync] Session summary: {entry}')
+" 2>/dev/null

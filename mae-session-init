@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# mae-session-init — Runs at SessionStart
+# Initializes MAE/TCC context, shows pending tasks, injects queue status into session.
+
+source ~/.claude/tier0.env 2>/dev/null
+TCC=~/.claude/bin/tcc
+MAE=~/.claude/bin/mae
+
+# Count queue states
+PENDING=$(python3 -c "
+from pathlib import Path
+import json, os
+d = Path.home() / '.claude/tasks'
+if not d.exists(): print(0); exit()
+count = sum(1 for f in d.glob('*.json') if json.loads(f.read_text()).get('status') == 'pending')
+print(count)
+" 2>/dev/null || echo "0")
+
+FAILED=$(python3 -c "
+from pathlib import Path
+import json
+d = Path.home() / '.claude/tasks'
+if not d.exists(): print(0); exit()
+count = sum(1 for f in d.glob('*.json') if json.loads(f.read_text()).get('status') == 'failed')
+print(count)
+" 2>/dev/null || echo "0")
+
+DONE=$(python3 -c "
+from pathlib import Path
+import json
+d = Path.home() / '.claude/tasks'
+if not d.exists(): print(0); exit()
+count = sum(1 for f in d.glob('*.json') if json.loads(f.read_text()).get('status') == 'done')
+print(count)
+" 2>/dev/null || echo "0")
+
+LAST_RUN=$(ls -t ~/.claude/tcc-logs/mae-*.md 2>/dev/null | head -1)
+LAST_RUN_TIME=""
+if [ -n "$LAST_RUN" ]; then
+    LAST_RUN_TIME=$(basename "$LAST_RUN" | sed 's/mae-//' | sed 's/.md//' | sed 's/-/ /')
+fi
+
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  MAE — Master Automation Engine  [SESSION INIT]             ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo "  Queue: ${PENDING} pending · ${DONE} done · ${FAILED} failed"
+[ -n "$LAST_RUN_TIME" ] && echo "  Last run: ${LAST_RUN_TIME}"
+echo ""
+
+if [ "$PENDING" -gt 0 ]; then
+    echo "  ⚡ ${PENDING} PENDING tasks — run: tcc fire all   OR   mae sprint"
+    $TCC list --status pending 2>/dev/null | tail -n +3 | head -5
+fi
+
+if [ "$FAILED" -gt 0 ]; then
+    echo "  ↺  ${FAILED} FAILED tasks  — run: tcc retry --fire"
+fi
+
+echo ""
+echo "  DEFAULT: every task → mae run 'goal' (12 agents · ~8s · max quality)"
+echo "  QUICK:   tcc blast 't1' 't2'... (parallel, no synthesis)"
+echo "  FULL:    mae daily (complete DigiMinds ops automation)"
