@@ -1,5 +1,9 @@
 # mae-master-automation-engine
 
+<!-- HMZ PORTFOLIO STANDARD -->
+> Portfolio status: active · Visibility: public · Source of truth: current repository source.
+<!-- END HMZ PORTFOLIO STANDARD -->
+
 > **MAE: Master Automation Engine** — Groq decomposes goals → specialist swarm → cross-LLM blast → synthesized output saved to logs.
 
 <p align="center">
