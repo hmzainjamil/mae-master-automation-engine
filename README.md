@@ -1,154 +1,62 @@
-# mae-master-automation-engine
+# MAE: Master Automation Engine
 
-> **MAE: Master Automation Engine** — Groq decomposes goals → specialist swarm → cross-LLM blast → synthesized output saved to logs.
+MAE is a collection of Python and shell scripts for decomposing goals, calling configured LLM providers, routing selected tasks through local helper commands, and saving run output. This repository is an integration layer: it depends on tools and configuration under the user's home directory and does not include TCC, Hermes, Paperclip, workflow-dag, llm-burst, provider credentials, or Claude Code itself.
 
-<p align="center"><a href="https://github.com/hmzainjamil/mae-master-automation-engine">Repository</a> · <a href="https://github.com/hmzainjamil/mae-master-automation-engine/commits/main">Commits</a> · <a href="https://github.com/hmzainjamil/mae-master-automation-engine/issues">Issues</a></p>
-<p align="center"><img alt="Documentation" src="https://img.shields.io/badge/documentation-deep%20editorial-lightgrey"> <img alt="Lifecycle" src="https://img.shields.io/badge/lifecycle-active-success"></p>
+## Repository map
 
-<!-- HMZ DEEP README v1 -->
-
-## At a glance
-
-| Field | Current state |
+| File | Purpose |
 |---|---|
-| Repository | mae-master-automation-engine |
-| Visibility | Public |
-| Lifecycle | Active |
-| Evidence basis | Current repository documentation and source-visible material |
+| `mae` | Main CLI for run, plan, sprint, daily, status, deploy, and register actions |
+| `mae-paperclip-bridge` | Reads and updates a local Paperclip service, creates local agent files, invokes MAE/TCC, and syncs run logs |
+| `mae-session-init` | Session-start hook candidate; reads queue state and prints status |
+| `mae-stop-sync` | Stop-hook candidate; marks some stale tasks failed and writes a queue summary |
+| `mae-task-intercept` | Prompt-submit hook candidate; injects routing instructions and may start background helpers or add tasks to TCC |
+| `README.md` | Repository guide |
 
-## Why this exists
+## CLI behavior
 
-**MAE: Master Automation Engine** — Groq decomposes goals → specialist swarm → cross-LLM blast → synthesized output saved to logs.
-
-This README focuses on the repository's documented scope and separates implementation claims from plans, external dependencies, and unsupported outcomes.
-
-## 🧠 CONCEPTS
-
-| Feature | Location | Description |
-|---|---|---|
-| CoreEngine | `core/engine.py` | Primary execution logic and orchestration layer |
-| ConfigManager | `config/manager.py` | Environment validation, hot-reload, API key checks |
-| ProviderAdapters | `adapters/` | Per-provider API wrappers with auth + retry logic |
-| TierRouter | `routing/tier0.py` | Ollama→DeepSeek→Gemini→Groq→GPT cost ladder |
-| OutputFormatter | `output/formatter.py` | Caveman-compressed, signal-dense output pipeline |
-| LogManager | `logs/manager.py` | Structured JSON logging to ~/.claude/tcc-logs/ |
-| HookHandler | `hooks/handler.py` | SessionStart/Stop integration for Claude Code |
-| RetryLogic | `core/retry.py` | Exponential backoff + alt-provider on persistent failure |
-| StatusTracker | `core/status.py` | Per-operation metrics: latency, cost, confidence scores |
-| Scheduler | `schedule/scheduler.py` | LaunchAgent-based cron scheduling for automation |
-
-## ⚙️ HOW IT WORKS
-
-```
-Input / Trigger (CLI command or hook event)
-    │
-    ▼
-ConfigManager: load .env, validate all provider API keys
-    │
-    ▼
-TierRouter: Ollama → DeepSeek → Gemini → Groq → GPT
-    │        (cost-ordered; local-first enforced always)
-    ▼
-CoreEngine: primary processing with selected provider adapter
-    │
-    ├── ProviderAdapter: API call with rate-limit handling
-    ├── RetryLogic: exponential backoff + alt provider on failure
-    ├── StatusTracker: record latency, cost, confidence score
-    │
-    ▼
-OutputFormatter: caveman-compress result to signal-dense format
-    │
-    ▼
-LogManager: persist full run record to ~/.claude/tcc-logs/
-    │
-    ▼
-stdout / file output / hook callback response
-```
-
-## 🚀 INSTALL
+The executable files document these command forms. They have not been run as part of this review.
 
 ```bash
-git clone https://github.com/hmzainjamil/mae-master-automation-engine
-cd mae-master-automation-engine
-pip install -r requirements.txt
-cp .env.example .env
-# Fill in: GROQ_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY
-# Optional: OPENAI_API_KEY, ANTHROPIC_API_KEY (fallback only)
-python setup.py verify    # confirms all provider connections live
-python setup.py hooks     # installs Claude Code SessionStart/Stop hooks
-mkdir -p ~/.claude/tcc-logs/  # create log directory
+./mae status
+./mae run "describe a goal" --plan-only
+./mae run "describe a goal"
+./mae plan "describe a goal"
+./mae sprint
+./mae daily
+./mae deploy WORKFLOW_NAME
+./mae register RESOURCE_FILE
+./mae-paperclip-bridge status
+./mae-paperclip-bridge run
+./mae-paperclip-bridge hire "role"
+./mae-paperclip-bridge sync
 ```
 
-## 📟 USAGE
+Command names do not imply a dry run:
 
-```bash
-# Primary usage — single command fires full pipeline
-python main.py "your goal or task description here"
+- `mae run ... --plan-only` still sends the goal to Groq for decomposition; it skips task execution.
+- `mae plan ...` sends the goal to Groq and adds the resulting tasks to TCC. It changes the queue.
+- `mae sprint` fires all pending TCC tasks.
+- `mae daily` adds six preset tasks, fires the TCC queue, and posts a status item to a local Paperclip endpoint.
+- `mae deploy` invokes the configured workflow-dag executable for a workflow file.
+- `mae register` checks that a file exists and prints the registry path; it does not update the registry.
+- The Paperclip bridge's `run`, `hire`, and `sync` modes can execute queued work, write agent files, or post data to the local Paperclip API.
 
-# Specify provider explicitly (skip auto-routing)
-python main.py --provider groq "summarize this document quickly"
+## Providers, data, and local dependencies
 
-# Output to file (default: stdout)
-python main.py "task description" --output ~/Downloads/result.md
+The main runner reads `~/.claude/tier0.env` when present and can send task text to Groq, Gemini, DeepSeek, Moonshot, llm-burst, and local Ollama/Hermes tools. Fallbacks may route a prompt to a different provider. The exact route depends on configured keys, local binaries, service availability, and source logic. No credentials should be committed to this repository.
 
-# Dry run — show routing plan without making any API calls
-python main.py --dry-run "test task to check routing"
+Runs create `~/.claude/tcc-logs` and write task reports there. The runner also writes shared Hermes context under `~/.claude/mae-hermes-ctx.json` and attempts to POST run metadata to Paperclip at `127.0.0.1:3100`. The bridge reads task and log data and can post goals, activities, and generated agent records to that service.
 
-# Verbose mode — shows provider selection, scores, latency
-python main.py --verbose "research task with full debug output"
+Several scripts assume macOS paths and commands such as `vm_stat`, `top -l`, and home-directory executables. The task-intercept hook reads submitted prompt text; depending on length, keywords, and RAM checks, it can asynchronously send part of that prompt to TCC or launch other local helpers. Review hook code and provider configuration before enabling it.
 
-# Batch mode — process multiple inputs from file
-python main.py --batch inputs.txt --output ~/Downloads/results/
+## Validation and limitations
 
-# Status and health verification
-python main.py status      # show all configured providers + health
-python main.py verify      # test live connections to all providers
-```
-
-## ⚙️ CONFIGURATION
-
-| Variable | Default | Description |
-|---|---|---|
-| `GROQ_API_KEY` | — | Groq Cloud API key (primary fast text provider) |
-| `GEMINI_API_KEY` | — | Google AI Studio key (long-context and multimodal) |
-| `DEEPSEEK_API_KEY` | — | DeepSeek API key (code specialist tasks) |
-| `OPENAI_API_KEY` | — | OpenAI (Tier 1 fallback; used after Tier 0 exhausted) |
-| `ANTHROPIC_API_KEY` | — | Claude (final resort; only on explicit user request) |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama endpoint (checked first always) |
-| `LOG_DIR` | `~/.claude/tcc-logs/` | Output log directory for all run records |
-| `TIMEOUT_S` | `30` | Per-operation timeout in seconds per provider |
-| `RETRY_COUNT` | `2` | Number of retry attempts before marking failed |
-| `CONFIDENCE_THRESHOLD` | `0.6` | Minimum confidence score to accept output (0.0-1.0) |
-| `COMPRESS_OUTPUT` | `true` | Apply caveman-compression to all outputs |
-| `LOG_LEVEL` | `INFO` | Logging verbosity: DEBUG / INFO / WARN / ERROR |
-| `LOCAL_FIRST` | `true` | Always try Ollama before any paid API call |
-| `AUTO_RETRY_ALT` | `true` | Automatically switch provider on persistent failure |
-| `OUTPUT_DIR` | `~/Downloads` | Default directory for all generated file outputs |
-
-## Validation and evidence
-
-No dedicated test or evaluation section was available in the current README.
-
-## 🔐 SECURITY CONSIDERATIONS
-
-## Limitations
-
-- Planned work is not presented as completed functionality.
-- Quantitative claims require reproducible evidence.
-- External provider behavior and pricing remain external dependencies.
-
-## 📚 RELATED REPOS IN THE HMZ AI SYSTEM
-
-| Repo | Role | Dependency |
-|---|---|---|
-| [G0DM0D3](https://github.com/hmzainjamil/G0DM0D3) | Multi-model racing + Liquid Response | Uses tier0-llm-router |
-| [mae-master-automation-engine](https://github.com/hmzainjamil/mae-master-automation-engine) | Goal decomposition + specialist swarm | Uses tcc, tier0 |
-| [tcc-task-command-center](https://github.com/hmzainjamil/tcc-task-command-center) | Parallel blast + queue + dashboard | Used by mae |
-| [tier0-llm-router](https://github.com/hmzainjamil/tier0-llm-router) | Cost-optimized routing ladder | Used by all |
-| [hermes-ai-system](https://github.com/hmzainjamil/hermes-ai-system) | Persistent agent + 80+ skills | Uses tier0, mcp |
-| [claude-ai-system-backup](https://github.com/hmzainjamil/claude-ai-system-backup) | System backup + restore | Backs up all |
-
-<div align="center">Built by <a href="https://github.com/hmzainjamil">HMZ</a> · Part of the <a href="https://github.com/hmzainjamil/claude-ai-system">HMZ Claude AI System</a> · Zero broken workflows</div>
+- The README's former Python package, environment-file, and `setup.py` installation instructions referenced files absent from the repository and have been removed.
+- No dependency manifest, automated test suite, or license file is present. GitHub metadata reports no declared license.
+- Provider calls, local TCC/Hermes/MAE integrations, Paperclip API behavior, and market/service outcomes are not verified here.
+- Some inline descriptions overstate behavior. For example, `mae register` does not register resources, and plan mode is not queue-free.
+- No script, hook, provider call, task queue, workflow, or service was run during this documentation review.
 
 ## Maintainer
 
